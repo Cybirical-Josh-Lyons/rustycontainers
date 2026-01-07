@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/dockertui-core", "crates/dockertui"]
+resolver = "2"
