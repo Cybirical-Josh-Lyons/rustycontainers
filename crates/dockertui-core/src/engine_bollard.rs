@@ -2,13 +2,13 @@ use std::pin::Pin;
 use anyhow::{anyhow, Result};
 use bollard::container::{
     ListContainersOptions, LogsOptions as BollardLogsOptions, RestartContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+    StartContainerOptions, StatsOptions, StopContainerOptions,
 };
 use bollard::image::{ListImagesOptions, RemoveImageOptions};
 use bollard::volume::ListVolumesOptions;
 use bollard::{Docker, API_DEFAULT_VERSION};
 use crate::engine::{Engine, EngineKind, LogsOptions};
-use crate::models::{ContainerRow, ImageRow, VolumeRow};
+use crate::models::{ContainerRow, ContainerStats, ImageRow, VolumeRow};
 use futures::{Stream, StreamExt};
 
 pub struct BollardEngine {
@@ -157,6 +157,108 @@ impl Engine for BollardEngine {
         })
     }
 
+    fn container_stats(&self, id: String) -> tokio::task::JoinHandle<Result<ContainerStats>> {
+        let docker = self.docker.clone();
+        tokio::spawn(async move {
+            let mut stream = docker.stats(
+                &id,
+                Some(StatsOptions {
+                    stream: false,
+                    one_shot: true,
+                }),
+            );
+
+            let stats = match stream.next().await {
+                Some(Ok(stats)) => stats,
+                Some(Err(e)) => return Err(anyhow!(e)),
+                None => return Err(anyhow!("No stats returned for container {id}")),
+            };
+
+            let cpu_delta = stats
+                .cpu_stats
+                .cpu_usage
+                .total_usage
+                .saturating_sub(stats.precpu_stats.cpu_usage.total_usage);
+            let system_delta = stats
+                .cpu_stats
+                .system_cpu_usage
+                .unwrap_or(0)
+                .saturating_sub(stats.precpu_stats.system_cpu_usage.unwrap_or(0));
+            let online_cpus = stats
+                .cpu_stats
+                .online_cpus
+                .or_else(|| {
+                    stats
+                        .cpu_stats
+                        .cpu_usage
+                        .percpu_usage
+                        .as_ref()
+                        .map(|v| v.len() as u64)
+                })
+                .unwrap_or(1);
+
+            let cpu_percent = if system_delta > 0 && cpu_delta > 0 {
+                (cpu_delta as f64 / system_delta as f64) * online_cpus as f64 * 100.0
+            } else {
+                0.0
+            };
+
+            let mem_usage = stats.memory_stats.usage.unwrap_or(0);
+            let mem_limit = stats.memory_stats.limit.unwrap_or(0);
+            let mem_percent = if mem_limit > 0 {
+                (mem_usage as f64 / mem_limit as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let (mut rx_bytes, mut tx_bytes) = (0u64, 0u64);
+            if let Some(networks) = stats.networks {
+                for net in networks.values() {
+                    rx_bytes = rx_bytes.saturating_add(net.rx_bytes);
+                    tx_bytes = tx_bytes.saturating_add(net.tx_bytes);
+                }
+            } else if let Some(network) = stats.network {
+                rx_bytes = network.rx_bytes;
+                tx_bytes = network.tx_bytes;
+            }
+
+            let (mut read_bytes, mut write_bytes) = (0u64, 0u64);
+            if let Some(entries) = stats.blkio_stats.io_service_bytes_recursive {
+                for entry in entries {
+                    match entry.op.as_str() {
+                        "Read" => read_bytes = read_bytes.saturating_add(entry.value),
+                        "Write" => write_bytes = write_bytes.saturating_add(entry.value),
+                        _ => {}
+                    }
+                }
+            }
+
+            let pids = stats.pids_stats.current.unwrap_or(0);
+
+            Ok(ContainerStats {
+                cpu_percent: format!("{cpu_percent:.2}%"),
+                mem_usage: format!(
+                    "{} / {}",
+                    format_bytes(mem_usage),
+                    format_bytes(mem_limit)
+                ),
+                mem_percent: format!("{mem_percent:.2}%"),
+                net_io: format!(
+                    "{} / {}",
+                    format_bytes(rx_bytes),
+                    format_bytes(tx_bytes)
+                ),
+                block_io: format!(
+                    "{} / {}",
+                    format_bytes(read_bytes),
+                    format_bytes(write_bytes)
+                ),
+                pids: pids.to_string(),
+                gpu: "n/a".to_string(),
+            })
+        })
+    }
+
     fn list_images(&self) -> tokio::task::JoinHandle<Result<Vec<ImageRow>>> {
         let docker = self.docker.clone();
         tokio::spawn(async move {
@@ -241,5 +343,25 @@ impl Engine for BollardEngine {
     fn start_engine(&self) -> tokio::task::JoinHandle<Result<()>> {
         // No-op for now; service-manager start is platform-specific.
         tokio::spawn(async move { Ok(()) })
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let mut size = bytes as f64;
+    let mut unit = 0usize;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }

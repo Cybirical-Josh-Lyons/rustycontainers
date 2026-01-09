@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use anyhow::{anyhow, Result};
 use crate::engine::{Engine, EngineKind, LogsOptions};
-use crate::models::{ContainerRow, ImageRow, VolumeRow};
+use crate::models::{ContainerRow, ContainerStats, ImageRow, VolumeRow};
 use futures::{stream, Stream};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -123,6 +123,41 @@ impl Engine for WslCliEngine {
             let joined = lines.join("\n");
             let s = stream::once(async move { Ok(joined) });
             Ok(Box::pin(s) as Pin<Box<dyn Stream<Item = Result<String>> + Send>>)
+        })
+    }
+
+    fn container_stats(&self, id: String) -> tokio::task::JoinHandle<Result<ContainerStats>> {
+        let distro = self.distro.clone();
+        tokio::spawn(async move {
+            let eng = WslCliEngine::new(distro);
+            let lines = eng
+                .run_lines(&[
+                    "docker",
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}\t{{.PIDs}}",
+                    &id,
+                ])
+                .await?;
+
+            let line = lines
+                .get(0)
+                .ok_or_else(|| anyhow!("No stats returned for container {id}"))?;
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 6 {
+                return Err(anyhow!("Unexpected stats output for container {id}"));
+            }
+
+            Ok(ContainerStats {
+                cpu_percent: parts[0].to_string(),
+                mem_usage: parts[1].to_string(),
+                mem_percent: parts[2].to_string(),
+                net_io: parts[3].to_string(),
+                block_io: parts[4].to_string(),
+                pids: parts[5].to_string(),
+                gpu: "n/a".to_string(),
+            })
         })
     }
 

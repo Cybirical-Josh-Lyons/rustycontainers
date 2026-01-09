@@ -1,4 +1,4 @@
-use crate::models::{ContainerRow, ImageRow, VolumeRow};
+use crate::models::{ContainerRow, ContainerStats, ImageRow, VolumeRow};
 use anyhow::Result;
 use futures::Stream;
 use std::pin::Pin;
@@ -32,6 +32,7 @@ pub trait Engine: Send + Sync {
         opts: LogsOptions,
     ) -> tokio::task::JoinHandle<Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>>>;
 
+    fn container_stats(&self, id: String) -> tokio::task::JoinHandle<Result<ContainerStats>>;
 
     fn list_images(&self) -> tokio::task::JoinHandle<Result<Vec<ImageRow>>>;
     fn remove_image(&self, id: String, force: bool) -> tokio::task::JoinHandle<Result<()>>;

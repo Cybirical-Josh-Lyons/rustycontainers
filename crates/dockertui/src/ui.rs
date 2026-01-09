@@ -148,6 +148,11 @@ fn draw_main(f: &mut Frame, area: Rect, app: &AppState) {
 fn draw_containers(f: &mut Frame, area: Rect, app: &AppState) {
     const SPIN: [&str; 10] = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
 
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(area);
+
     let header = Row::new(vec!["", "Name", "Image", "State", "Status", "ID"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -213,7 +218,8 @@ fn draw_containers(f: &mut Frame, area: Rect, app: &AppState) {
             .borders(Borders::ALL),
     );
 
-    f.render_widget(table, area);
+    f.render_widget(table, panes[0]);
+    draw_container_stats(f, panes[1], app);
 }
 
 fn draw_images(f: &mut Frame, area: Rect, app: &AppState) {
@@ -342,6 +348,70 @@ fn draw_shell(f: &mut Frame, area: Rect, app: &AppState) {
             f.set_cursor(cursor_x, cursor_y);
         }
     }
+}
+
+fn draw_container_stats(f: &mut Frame, area: Rect, app: &AppState) {
+    let block = Block::default()
+        .title("Resource Usage")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+
+    let mut lines = Vec::new();
+
+    let row = app.containers.get(app.selected_container);
+    if let Some(container) = row {
+        lines.push(Line::from(vec![
+            Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(container.name.as_str()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(container.state.as_str()),
+        ]));
+        lines.push(Line::from(""));
+
+        if let Some(err) = &app.container_stats_error {
+            lines.push(Line::from(Span::styled(
+                err.as_str(),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if app.container_stats_loading {
+            lines.push(Line::from(Span::styled(
+                "Loading stats...",
+                Style::default().fg(Color::Yellow),
+            )));
+        } else if let Some(stats) = &app.container_stats {
+            lines.push(stat_line("CPU", &stats.cpu_percent));
+            lines.push(stat_line(
+                "Memory",
+                &format!("{} ({})", stats.mem_usage, stats.mem_percent),
+            ));
+            lines.push(stat_line("Net I/O", &stats.net_io));
+            lines.push(stat_line("Block I/O", &stats.block_io));
+            lines.push(stat_line("PIDs", &stats.pids));
+            lines.push(stat_line("GPU", &stats.gpu));
+        } else {
+            lines.push(Line::from("No stats available."));
+        }
+    } else {
+        lines.push(Line::from("No containers."));
+    }
+
+    let text = Text::from(lines);
+    let p = Paragraph::new(text).wrap(Wrap { trim: false });
+
+    f.render_widget(block, area);
+    f.render_widget(p, inner);
+}
+
+fn stat_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label}: "),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(value.to_string()),
+    ])
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &AppState) {

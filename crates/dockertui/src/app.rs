@@ -8,7 +8,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dockertui_core::engine::{Engine, LogsOptions};
-use dockertui_core::models::{ContainerRow, ImageRow, VolumeRow};
+use dockertui_core::models::{ContainerRow, ContainerStats, ImageRow, VolumeRow};
 use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -30,6 +30,8 @@ enum UiMsg {
     ContainersActivityDone(String),
     Status(String),
     SetContainers(Vec<ContainerRow>),
+    ContainerStats { id: String, stats: ContainerStats },
+    ContainerStatsError { id: String, error: String },
     ShellOutput(String),
     ShellClosed,
 }
@@ -59,6 +61,13 @@ pub struct AppState {
 
     pub engine_daemon_state: dockertui_core::daemon::DaemonState,
     pub stopping_containers: HashMap<String, usize>,
+
+    pub container_stats: Option<ContainerStats>,
+    pub container_stats_for: Option<String>,
+    pub container_stats_loading: bool,
+    pub container_stats_error: Option<String>,
+    pub container_stats_updated_at: Option<Instant>,
+    pub container_stats_requested_at: Option<Instant>,
 
     pub shell_active: bool,
     pub shell_title: String,
@@ -93,6 +102,12 @@ impl AppState {
 
             engine_daemon_state: dockertui_core::daemon::DaemonState::Unknown,
             stopping_containers: HashMap::new(),
+            container_stats: None,
+            container_stats_for: None,
+            container_stats_loading: false,
+            container_stats_error: None,
+            container_stats_updated_at: None,
+            container_stats_requested_at: None,
             shell_active: false,
             shell_title: String::new(),
             shell_lines: Vec::new(),
@@ -120,6 +135,7 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
 
     // Initial data
     refresh_tab(engine.clone(), &mut app).await;
+    request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
 
     let tick_rate = Duration::from_millis(30);
     let mut last_auto_refresh = Instant::now();
@@ -138,6 +154,7 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                 && last_auto_refresh.elapsed() > Duration::from_secs(1)
             {
                 refresh_tab(engine.clone(), &mut app).await;
+                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
                 last_auto_refresh = Instant::now();
             }
         }
@@ -194,6 +211,23 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                     app.containers = list;
                     if app.selected_container >= app.containers.len() {
                         app.selected_container = app.containers.len().saturating_sub(1);
+                    }
+                    request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
+                }
+                UiMsg::ContainerStats { id, stats } => {
+                    if app.container_stats_for.as_deref() == Some(id.as_str()) {
+                        app.container_stats = Some(stats);
+                        app.container_stats_loading = false;
+                        app.container_stats_error = None;
+                        app.container_stats_updated_at = Some(Instant::now());
+                    }
+                }
+                UiMsg::ContainerStatsError { id, error } => {
+                    if app.container_stats_for.as_deref() == Some(id.as_str()) {
+                        app.container_stats = None;
+                        app.container_stats_loading = false;
+                        app.container_stats_error = Some(error);
+                        app.container_stats_updated_at = None;
                     }
                 }
                 UiMsg::ShellOutput(text) => {
@@ -276,15 +310,26 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                             Action::NextTab => {
                                 app.tab = app.tab.next();
                                 refresh_tab(engine.clone(), &mut app).await;
+                                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
                             }
                             Action::PrevTab => {
                                 app.tab = app.tab.prev();
                                 refresh_tab(engine.clone(), &mut app).await;
+                                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
                             }
-                            Action::Refresh => refresh_tab(engine.clone(), &mut app).await,
+                            Action::Refresh => {
+                                refresh_tab(engine.clone(), &mut app).await;
+                                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
+                            }
 
-                            Action::Down => move_down(&mut app),
-                            Action::Up => move_up(&mut app),
+                            Action::Down => {
+                                move_down(&mut app);
+                                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
+                            }
+                            Action::Up => {
+                                move_up(&mut app);
+                                request_selected_container_stats(engine.clone(), &mut app, ui_tx.clone());
+                            }
 
                             Action::Start => start_selected(engine.clone(), &mut app, ui_tx.clone()).await,
                             Action::Stop => stop_selected(engine.clone(), &mut app, ui_tx.clone()).await,
@@ -623,6 +668,85 @@ fn move_up(app: &mut AppState) {
             app.logs_scroll = app.logs_scroll.saturating_sub(1);
         }
     }
+}
+
+fn request_selected_container_stats(
+    engine: Arc<dyn Engine>,
+    app: &mut AppState,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<UiMsg>,
+) {
+    if app.tab != Tab::Containers {
+        return;
+    }
+
+    let Some(row) = app.containers.get(app.selected_container) else {
+        app.container_stats = None;
+        app.container_stats_for = None;
+        app.container_stats_loading = false;
+        app.container_stats_error = None;
+        app.container_stats_updated_at = None;
+        app.container_stats_requested_at = None;
+        return;
+    };
+
+    let id = row.id.clone();
+    let same_id = app.container_stats_for.as_deref() == Some(id.as_str());
+    if same_id && app.container_stats_loading {
+        return;
+    }
+
+    app.container_stats_for = Some(id.clone());
+
+    if app.engine_daemon_state != dockertui_core::daemon::DaemonState::Running {
+        app.container_stats = None;
+        app.container_stats_loading = false;
+        app.container_stats_error = Some("Engine is not running".into());
+        app.container_stats_updated_at = None;
+        return;
+    }
+
+    if row.state != "running" {
+        app.container_stats = None;
+        app.container_stats_loading = false;
+        app.container_stats_error = Some("Container is not running".into());
+        app.container_stats_updated_at = None;
+        return;
+    }
+
+    let refresh_window = Duration::from_millis(800);
+    if same_id {
+        if let Some(updated_at) = app.container_stats_updated_at {
+            if updated_at.elapsed() < refresh_window {
+                return;
+            }
+        }
+        if let Some(requested_at) = app.container_stats_requested_at {
+            if requested_at.elapsed() < refresh_window {
+                return;
+            }
+        }
+    }
+
+    app.container_stats_loading = app.container_stats.is_none() || !same_id;
+    app.container_stats_error = None;
+    app.container_stats_requested_at = Some(Instant::now());
+
+    tokio::spawn(async move {
+        let result = match engine.container_stats(id.clone()).await {
+            Ok(Ok(stats)) => Ok(stats),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(e) => Err(format!("Task error: {e}")),
+        };
+
+        match result {
+            Ok(stats) => {
+                let _ = ui_tx.send(UiMsg::ContainerStats { id, stats });
+            }
+            Err(error) => {
+                let _ = ui_tx.send(UiMsg::ContainerStatsError { id, error });
+            }
+        }
+    });
 }
 
 async fn start_selected(

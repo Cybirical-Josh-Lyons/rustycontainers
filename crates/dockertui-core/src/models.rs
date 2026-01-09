@@ -8,6 +8,17 @@ pub struct ContainerRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct ContainerStats {
+    pub cpu_percent: String,
+    pub mem_usage: String,
+    pub mem_percent: String,
+    pub net_io: String,
+    pub block_io: String,
+    pub pids: String,
+    pub gpu: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImageRow {
     pub id: String,
     pub tags: String,
