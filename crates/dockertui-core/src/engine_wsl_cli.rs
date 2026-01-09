@@ -149,6 +149,10 @@ impl Engine for WslCliEngine {
                 return Err(anyhow!("Unexpected stats output for container {id}"));
             }
 
+            let (mem_usage, mem_limit) = parse_usage_pair(parts[1]);
+            let (net_rx, net_tx) = parse_usage_pair(parts[3]);
+            let (block_read, block_write) = parse_usage_pair(parts[4]);
+
             Ok(ContainerStats {
                 cpu_percent: parts[0].to_string(),
                 mem_usage: parts[1].to_string(),
@@ -157,6 +161,15 @@ impl Engine for WslCliEngine {
                 block_io: parts[4].to_string(),
                 pids: parts[5].to_string(),
                 gpu: "n/a".to_string(),
+                cpu_percent_value: parse_percent(parts[0]).unwrap_or(0.0),
+                mem_usage_bytes: mem_usage,
+                mem_limit_bytes: mem_limit,
+                mem_percent_value: parse_percent(parts[2]).unwrap_or(0.0),
+                net_rx_bytes: net_rx,
+                net_tx_bytes: net_tx,
+                block_read_bytes: block_read,
+                block_write_bytes: block_write,
+                pids_value: parts[5].trim().parse::<u64>().unwrap_or(0),
             })
         })
     }
@@ -243,4 +256,49 @@ impl Engine for WslCliEngine {
             Ok(())
         })
     }
+}
+
+fn parse_percent(input: &str) -> Option<f64> {
+    let trimmed = input.trim().trim_end_matches('%');
+    trimmed.parse::<f64>().ok()
+}
+
+fn parse_usage_pair(input: &str) -> (u64, u64) {
+    let mut parts = input.split('/');
+    let left = parts.next().unwrap_or("").trim();
+    let right = parts.next().unwrap_or("").trim();
+    (parse_bytes(left).unwrap_or(0), parse_bytes(right).unwrap_or(0))
+}
+
+fn parse_bytes(input: &str) -> Option<u64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut number = String::new();
+    let mut unit = String::new();
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            number.push(ch);
+        } else if !ch.is_whitespace() {
+            unit.push(ch);
+        }
+    }
+
+    let value = number.parse::<f64>().ok()?;
+    let multiplier = match unit.as_str() {
+        "" | "B" => 1.0,
+        "kB" | "KB" => 1_000.0,
+        "KiB" => 1024.0,
+        "MB" => 1_000_000.0,
+        "MiB" => 1024.0 * 1024.0,
+        "GB" => 1_000_000_000.0,
+        "GiB" => 1024.0 * 1024.0 * 1024.0,
+        "TB" => 1_000_000_000_000.0,
+        "TiB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+
+    Some((value * multiplier) as u64)
 }

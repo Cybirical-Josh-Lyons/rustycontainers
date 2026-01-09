@@ -255,6 +255,15 @@ impl Engine for BollardEngine {
                 ),
                 pids: pids.to_string(),
                 gpu: "n/a".to_string(),
+                cpu_percent_value: cpu_percent,
+                mem_usage_bytes: mem_usage,
+                mem_limit_bytes: mem_limit,
+                mem_percent_value: mem_percent,
+                net_rx_bytes: rx_bytes,
+                net_tx_bytes: tx_bytes,
+                block_read_bytes: read_bytes,
+                block_write_bytes: write_bytes,
+                pids_value: pids,
             })
         })
     }

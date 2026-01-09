@@ -19,6 +19,7 @@ pub enum Action {
     Remove,
 
     ToggleFollow,
+    ToggleResourceTab,
     StartEngine,
     StopEngine,
     RestartEngine,
@@ -58,6 +59,7 @@ impl Keymap {
             Delete => Some(Action::Remove),
 
             Char('f') => Some(Action::ToggleFollow),
+            Char('g') => Some(Action::ToggleResourceTab),
 
             Char('e') if ctrl => Some(Action::StartEngine),
             Char('e') => Some(Action::Shell),

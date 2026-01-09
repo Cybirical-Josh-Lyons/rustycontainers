@@ -16,6 +16,15 @@ pub struct ContainerStats {
     pub block_io: String,
     pub pids: String,
     pub gpu: String,
+    pub cpu_percent_value: f64,
+    pub mem_usage_bytes: u64,
+    pub mem_limit_bytes: u64,
+    pub mem_percent_value: f64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub block_read_bytes: u64,
+    pub block_write_bytes: u64,
+    pub pids_value: u64,
 }
 
 #[derive(Debug, Clone)]

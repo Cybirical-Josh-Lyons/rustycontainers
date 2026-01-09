@@ -13,12 +13,12 @@ use futures::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use ratatui::layout::{Constraint, Direction, Layout};
 use portable_pty::PtySize;
-use std::{collections::HashMap, io, sync::Arc, time::Duration, time::Instant};
+use std::{collections::{HashMap, VecDeque}, io, sync::Arc, time::Duration, time::Instant};
 use std::io::Read;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::keymap::{Action, Keymap};
-use crate::ui::{draw, Tab};
+use crate::ui::{draw, ResourceTab, Tab};
 
 enum UiMsg {
     LogLine(String),
@@ -38,6 +38,7 @@ enum UiMsg {
 
 pub struct AppState {
     pub tab: Tab,
+    pub resource_tab: ResourceTab,
     pub status: String,
 
     pub containers: Vec<ContainerRow>,
@@ -68,6 +69,7 @@ pub struct AppState {
     pub container_stats_error: Option<String>,
     pub container_stats_updated_at: Option<Instant>,
     pub container_stats_requested_at: Option<Instant>,
+    pub container_stats_history: HashMap<String, VecDeque<StatsPoint>>,
 
     pub shell_active: bool,
     pub shell_title: String,
@@ -80,6 +82,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             tab: Tab::Containers,
+            resource_tab: ResourceTab::Stats,
             status: "Ready".into(),
 
             containers: vec![],
@@ -108,6 +111,7 @@ impl AppState {
             container_stats_error: None,
             container_stats_updated_at: None,
             container_stats_requested_at: None,
+            container_stats_history: HashMap::new(),
             shell_active: false,
             shell_title: String::new(),
             shell_lines: Vec::new(),
@@ -115,6 +119,17 @@ impl AppState {
             shell_session: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StatsPoint {
+    pub at: Instant,
+    pub cpu_percent: u64,
+    pub mem_percent: u64,
+    pub net_total: u64,
+    pub block_total: u64,
+    pub pids: u64,
+    pub mem_usage_bytes: u64,
 }
 
 pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
@@ -220,6 +235,7 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                         app.container_stats_loading = false;
                         app.container_stats_error = None;
                         app.container_stats_updated_at = Some(Instant::now());
+                        push_stats_history(&mut app, &id);
                     }
                 }
                 UiMsg::ContainerStatsError { id, error } => {
@@ -271,6 +287,9 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                 Event::Mouse(mouse) => {
                     if app.tab == Tab::Logs {
                         handle_logs_mouse_scroll(&mut app, mouse);
+                    }
+                    if app.tab == Tab::Containers {
+                        handle_resource_tabs_click(&mut app, &terminal, mouse);
                     }
                 }
                 Event::Key(key) => {
@@ -352,6 +371,18 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
                                     app.logs_scroll = max_logs_scroll(&app);
                                 }
                                 app.status = format!("Logs follow: {}", app.logs_follow);
+                            }
+                            Action::ToggleResourceTab => {
+                                if app.tab == Tab::Containers {
+                                    app.resource_tab = match app.resource_tab {
+                                        ResourceTab::Stats => ResourceTab::Graphs,
+                                        ResourceTab::Graphs => ResourceTab::Stats,
+                                    };
+                                    app.status = match app.resource_tab {
+                                        ResourceTab::Stats => "Resource view: Stats".into(),
+                                        ResourceTab::Graphs => "Resource view: Graphs".into(),
+                                    };
+                                }
                             }
 
                             Action::StartEngine => {
@@ -467,6 +498,84 @@ fn handle_logs_mouse_scroll(app: &mut AppState, mouse: MouseEvent) {
         let max_scroll = max_logs_scroll(app);
         app.logs_scroll = app.logs_scroll.saturating_add(delta as usize).min(max_scroll);
     }
+}
+
+fn handle_resource_tabs_click(
+    app: &mut AppState,
+    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
+    mouse: MouseEvent,
+) {
+    use crossterm::event::MouseButton;
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left)
+        | MouseEventKind::Up(MouseButton::Left)
+        | MouseEventKind::Drag(MouseButton::Left) => {}
+        _ => return,
+    }
+    if app.shell_active || app.tab != Tab::Containers {
+        return;
+    }
+
+    let size = match terminal.size() {
+        Ok(size) => size,
+        Err(_) => return,
+    };
+    let rect = match resource_tabs_rect(size) {
+        Some(rect) => rect,
+        None => return,
+    };
+
+    let x = mouse.column;
+    let y = mouse.row;
+    if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
+        return;
+    }
+
+    let mid = rect.x + rect.width / 2;
+    app.resource_tab = if x < mid {
+        ResourceTab::Stats
+    } else {
+        ResourceTab::Graphs
+    };
+}
+
+fn resource_tabs_rect(area: ratatui::layout::Rect) -> Option<ratatui::layout::Rect> {
+    if area.width < 10 || area.height < 10 {
+        return None;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let main = chunks[2];
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(main);
+    let resource_area = panes[1];
+    if resource_area.width < 3 || resource_area.height < 3 {
+        return None;
+    }
+
+    let inner = ratatui::layout::Rect {
+        x: resource_area.x + 1,
+        y: resource_area.y + 1,
+        width: resource_area.width.saturating_sub(2),
+        height: resource_area.height.saturating_sub(2),
+    };
+    if inner.height < 3 {
+        return None;
+    }
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+    Some(sections[0])
 }
 
 fn sanitize_log_line(line: &str) -> String {
@@ -695,6 +804,14 @@ fn request_selected_container_stats(
         return;
     }
 
+    if !same_id {
+        app.container_stats = None;
+        app.container_stats_error = None;
+        app.container_stats_loading = false;
+        app.container_stats_updated_at = None;
+        app.container_stats_requested_at = None;
+    }
+
     app.container_stats_for = Some(id.clone());
 
     if app.engine_daemon_state != dockertui_core::daemon::DaemonState::Running {
@@ -747,6 +864,46 @@ fn request_selected_container_stats(
             }
         }
     });
+}
+
+fn push_stats_history(app: &mut AppState, id: &str) {
+    if app.container_stats_for.as_deref() != Some(id) {
+        return;
+    }
+    let Some(stats) = &app.container_stats else {
+        return;
+    };
+
+    let history = app
+        .container_stats_history
+        .entry(id.to_string())
+        .or_insert_with(VecDeque::new);
+
+    let point = StatsPoint {
+        at: Instant::now(),
+        cpu_percent: stats.cpu_percent_value.max(0.0).round() as u64,
+        mem_percent: stats.mem_percent_value.max(0.0).round() as u64,
+        net_total: stats.net_rx_bytes.saturating_add(stats.net_tx_bytes),
+        block_total: stats.block_read_bytes.saturating_add(stats.block_write_bytes),
+        pids: stats.pids_value,
+        mem_usage_bytes: stats.mem_usage_bytes,
+    };
+
+    history.push_back(point);
+
+    let max_age = Duration::from_secs(300);
+    while let Some(front) = history.front() {
+        if front.at.elapsed() > max_age {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if history.len() > 400 {
+        let extra = history.len() - 400;
+        history.drain(0..extra);
+    }
 }
 
 async fn start_selected(

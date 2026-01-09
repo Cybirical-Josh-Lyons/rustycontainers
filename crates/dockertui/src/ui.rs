@@ -3,11 +3,12 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{
-        Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Table, Tabs, Wrap,
+        Axis, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Table, Tabs, Wrap,
     },
     Frame,
 };
+use std::time::Instant;
 
 use crate::app::AppState;
 use crate::app::selected_container_is_running;
@@ -20,6 +21,20 @@ pub enum Tab {
     Logs,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceTab {
+    Stats,
+    Graphs,
+}
+
+impl ResourceTab {
+    pub fn index(self) -> usize {
+        match self {
+            ResourceTab::Stats => 0,
+            ResourceTab::Graphs => 1,
+        }
+    }
+}
 impl Tab {
     pub fn next(self) -> Self {
         match self {
@@ -219,7 +234,7 @@ fn draw_containers(f: &mut Frame, area: Rect, app: &AppState) {
     );
 
     f.render_widget(table, panes[0]);
-    draw_container_stats(f, panes[1], app);
+    draw_container_resources(f, panes[1], app);
 }
 
 fn draw_images(f: &mut Frame, area: Rect, app: &AppState) {
@@ -350,12 +365,32 @@ fn draw_shell(f: &mut Frame, area: Rect, app: &AppState) {
     }
 }
 
-fn draw_container_stats(f: &mut Frame, area: Rect, app: &AppState) {
+fn draw_container_resources(f: &mut Frame, area: Rect, app: &AppState) {
     let block = Block::default()
         .title("Resource Usage")
         .borders(Borders::ALL);
     let inner = block.inner(area);
 
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .split(inner);
+
+    let titles = vec![Line::from("Stats"), Line::from("Graphs")];
+    let tabs = Tabs::new(titles)
+        .select(app.resource_tab.index())
+        .divider("|");
+
+    f.render_widget(block, area);
+    f.render_widget(tabs, sections[0]);
+
+    match app.resource_tab {
+        ResourceTab::Stats => draw_container_stats(f, sections[1], app),
+        ResourceTab::Graphs => draw_container_graphs(f, sections[1], app),
+    }
+}
+
+fn draw_container_stats(f: &mut Frame, area: Rect, app: &AppState) {
     let mut lines = Vec::new();
 
     let row = app.containers.get(app.selected_container);
@@ -399,9 +434,7 @@ fn draw_container_stats(f: &mut Frame, area: Rect, app: &AppState) {
 
     let text = Text::from(lines);
     let p = Paragraph::new(text).wrap(Wrap { trim: false });
-
-    f.render_widget(block, area);
-    f.render_widget(p, inner);
+    f.render_widget(p, area);
 }
 
 fn stat_line(label: &str, value: &str) -> Line<'static> {
@@ -412,6 +445,226 @@ fn stat_line(label: &str, value: &str) -> Line<'static> {
         ),
         Span::raw(value.to_string()),
     ])
+}
+
+fn draw_container_graphs(f: &mut Frame, area: Rect, app: &AppState) {
+    let now = Instant::now();
+    let empty = std::collections::VecDeque::new();
+    let history = app
+        .containers
+        .get(app.selected_container)
+        .and_then(|row| app.container_stats_history.get(&row.id))
+        .unwrap_or(&empty);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(17),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+        ])
+        .split(area);
+
+    let (cpu_points, cpu_latest) = percent_points(history, now, |p| p.cpu_percent as f64);
+    let (mem_points, mem_latest) = percent_points(history, now, |p| p.mem_percent as f64);
+    let (net_points, net_latest) = rate_points(history, now, |p| p.net_total);
+    let (block_points, block_latest) = rate_points(history, now, |p| p.block_total);
+    let (pids_points, pids_latest) = scaled_points(history, now, |p| p.pids as f64);
+    let (mem_usage_points, mem_usage_latest) =
+        scaled_points(history, now, |p| p.mem_usage_bytes as f64);
+
+    let cpu_title = value_title("CPU %", cpu_latest.map(|v| format!("{v:.1}%")));
+    let mem_title = value_title("Memory %", mem_latest.map(|v| format!("{v:.1}%")));
+    let net_title = value_title(
+        "Net I/O",
+        net_latest.map(|v| format!("{}/s", format_bytes(v as u64))),
+    );
+    let block_title = value_title(
+        "Block I/O",
+        block_latest.map(|v| format!("{}/s", format_bytes(v as u64))),
+    );
+    let pids_title = value_title("PIDs", pids_latest.map(|v| format!("{v:.0}")));
+    let mem_usage_title = value_title(
+        "Memory",
+        mem_usage_latest.map(|v| format!("{}", format_bytes(v as u64))),
+    );
+
+    draw_line_chart(f, chunks[0], cpu_title, cpu_points, Color::LightRed);
+    draw_line_chart(f, chunks[1], mem_title, mem_points, Color::Yellow);
+    draw_line_chart(f, chunks[2], net_title, net_points, Color::Cyan);
+    draw_line_chart(f, chunks[3], block_title, block_points, Color::LightBlue);
+    draw_line_chart(f, chunks[4], pids_title, pids_points, Color::Green);
+    draw_line_chart(f, chunks[5], mem_usage_title, mem_usage_points, Color::LightGreen);
+}
+
+fn draw_line_chart(
+    f: &mut Frame,
+    area: Rect,
+    title: String,
+    data: Vec<(f64, f64)>,
+    color: Color,
+) {
+    let block = Block::default().title(title).borders(Borders::ALL);
+    if data.is_empty() {
+        let p = Paragraph::new("No data").block(block).wrap(Wrap { trim: false });
+        f.render_widget(p, area);
+        return;
+    }
+
+    let dataset = Dataset::default()
+        .marker(ratatui::symbols::Marker::Braille)
+        .graph_type(GraphType::Line)
+        .style(Style::default().fg(color))
+        .data(&data);
+
+    let x_max = HISTORY_WINDOW_SECS;
+    let chart = Chart::new(vec![dataset])
+        .block(block)
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, x_max])
+                .labels(vec![Span::raw("5m"), Span::raw("2.5m"), Span::raw("now")]),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, 100.0])
+                .labels(vec![Span::raw("0"), Span::raw("50"), Span::raw("100")]),
+        );
+
+    f.render_widget(chart, area);
+}
+
+const HISTORY_WINDOW_SECS: f64 = 300.0;
+
+fn percent_points(
+    history: &std::collections::VecDeque<crate::app::StatsPoint>,
+    now: Instant,
+    value: fn(&crate::app::StatsPoint) -> f64,
+) -> (Vec<(f64, f64)>, Option<f64>) {
+    let mut points = Vec::new();
+    let mut latest = None;
+    for point in history {
+        if let Some(x) = time_x(now, point.at) {
+            let mut y = value(point);
+            if y < 0.0 {
+                y = 0.0;
+            }
+            if y > 100.0 {
+                y = 100.0;
+            }
+            points.push((x, y));
+            latest = Some(value(point));
+        }
+    }
+    (points, latest)
+}
+
+fn scaled_points(
+    history: &std::collections::VecDeque<crate::app::StatsPoint>,
+    now: Instant,
+    value: fn(&crate::app::StatsPoint) -> f64,
+) -> (Vec<(f64, f64)>, Option<f64>) {
+    let mut max: f64 = 0.0;
+    for point in history {
+        if time_x(now, point.at).is_some() {
+            max = max.max(value(point));
+        }
+    }
+
+    let mut points = Vec::new();
+    let mut latest = None;
+    for point in history {
+        if let Some(x) = time_x(now, point.at) {
+            let raw = value(point);
+            let y = if max > 0.0 { (raw / max) * 100.0 } else { 0.0 };
+            points.push((x, y.clamp(0.0, 100.0)));
+            latest = Some(raw);
+        }
+    }
+    (points, latest)
+}
+
+fn rate_points(
+    history: &std::collections::VecDeque<crate::app::StatsPoint>,
+    now: Instant,
+    value: fn(&crate::app::StatsPoint) -> u64,
+) -> (Vec<(f64, f64)>, Option<f64>) {
+    let mut rates: Vec<(Instant, f64)> = Vec::new();
+    let mut prev: Option<&crate::app::StatsPoint> = None;
+    for point in history {
+        let rate = if let Some(prev) = prev {
+            let dt = point.at.saturating_duration_since(prev.at).as_secs_f64();
+            if dt > 0.0 {
+                let cur = value(point);
+                let prev_val = value(prev);
+                let delta = cur.saturating_sub(prev_val) as f64;
+                delta / dt
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        rates.push((point.at, rate));
+        prev = Some(point);
+    }
+
+    let mut max: f64 = 0.0;
+    for (at, rate) in &rates {
+        if time_x(now, *at).is_some() {
+            max = max.max(*rate);
+        }
+    }
+
+    let mut points = Vec::new();
+    let mut latest = None;
+    for (at, rate) in rates {
+        if let Some(x) = time_x(now, at) {
+            let y = if max > 0.0 { (rate / max) * 100.0 } else { 0.0 };
+            points.push((x, y.clamp(0.0, 100.0)));
+            latest = Some(rate);
+        }
+    }
+    (points, latest)
+}
+
+fn time_x(now: Instant, at: Instant) -> Option<f64> {
+    let age = now.saturating_duration_since(at).as_secs_f64();
+    if age > HISTORY_WINDOW_SECS {
+        None
+    } else {
+        Some(HISTORY_WINDOW_SECS - age)
+    }
+}
+
+fn value_title(label: &str, value: Option<String>) -> String {
+    match value {
+        Some(v) => format!("{label} {v}"),
+        None => label.to_string(),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let mut size = bytes as f64;
+    let mut unit = 0usize;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &AppState) {
@@ -442,7 +695,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &AppState) {
         Span::raw(format!("{label}  |  ")),
         Span::raw(&app.status),
         Span::raw("  |  "),
-        Span::raw("Tab/Shift+Tab | ↑/↓ | F5 refresh | "),
+        Span::raw("Tab/Shift+Tab | ↑/↓ | F5 refresh | G resource view | "),
         logs_span,
         Span::raw(" | "),
         shell_span,
