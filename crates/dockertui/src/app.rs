@@ -475,6 +475,19 @@ pub async fn run(engine: Arc<dyn Engine>) -> Result<()> {
     Ok(())
 }
 
+const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn await_engine<T>(
+    handle: tokio::task::JoinHandle<anyhow::Result<T>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(ENGINE_CALL_TIMEOUT, handle).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(e))) => Err(format!("{e}")),
+        Ok(Err(e)) => Err(format!("Task error: {e}")),
+        Err(_) => Err("Timed out waiting for Docker response".into()),
+    }
+}
+
 fn handle_logs_mouse_scroll(app: &mut AppState, mouse: MouseEvent) {
     let delta = match mouse.kind {
         MouseEventKind::ScrollUp => -3,
@@ -644,44 +657,41 @@ async fn refresh_tab(engine: Arc<dyn Engine>, app: &mut AppState) {
     match app.tab {
         Tab::Containers => {
             app.status = "Refreshing containers...".into();
-            match engine.list_containers().await {
-                Ok(Ok(list)) => {
+            match await_engine(engine.list_containers()).await {
+                Ok(list) => {
                     app.containers = list;
                     if app.selected_container >= app.containers.len() {
                         app.selected_container = app.containers.len().saturating_sub(1);
                     }
                     app.status = format!("Containers: {}", app.containers.len());
                 }
-                Ok(Err(e)) => app.status = format!("Error: {e}"),
-                Err(e) => app.status = format!("Task error: {e}"),
+                Err(e) => app.status = format!("Error: {e}"),
             }
         }
         Tab::Images => {
             app.status = "Refreshing images...".into();
-            match engine.list_images().await {
-                Ok(Ok(list)) => {
+            match await_engine(engine.list_images()).await {
+                Ok(list) => {
                     app.images = list;
                     if app.selected_image >= app.images.len() {
                         app.selected_image = app.images.len().saturating_sub(1);
                     }
                     app.status = format!("Images: {}", app.images.len());
                 }
-                Ok(Err(e)) => app.status = format!("Error: {e}"),
-                Err(e) => app.status = format!("Task error: {e}"),
+                Err(e) => app.status = format!("Error: {e}"),
             }
         }
         Tab::Volumes => {
             app.status = "Refreshing volumes...".into();
-            match engine.list_volumes().await {
-                Ok(Ok(list)) => {
+            match await_engine(engine.list_volumes()).await {
+                Ok(list) => {
                     app.volumes = list;
                     if app.selected_volume >= app.volumes.len() {
                         app.selected_volume = app.volumes.len().saturating_sub(1);
                     }
                     app.status = format!("Volumes: {}", app.volumes.len());
                 }
-                Ok(Err(e)) => app.status = format!("Error: {e}"),
-                Err(e) => app.status = format!("Task error: {e}"),
+                Err(e) => app.status = format!("Error: {e}"),
             }
         }
         Tab::Logs => {
@@ -849,11 +859,7 @@ fn request_selected_container_stats(
     app.container_stats_requested_at = Some(Instant::now());
 
     tokio::spawn(async move {
-        let result = match engine.container_stats(id.clone()).await {
-            Ok(Ok(stats)) => Ok(stats),
-            Ok(Err(e)) => Err(format!("{e}")),
-            Err(e) => Err(format!("Task error: {e}")),
-        };
+        let result = await_engine(engine.container_stats(id.clone())).await;
 
         match result {
             Ok(stats) => {
